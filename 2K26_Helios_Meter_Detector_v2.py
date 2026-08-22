@@ -240,7 +240,8 @@ class CVWorker:
             
             # Draw instruction
             overlay.text(
-                960, 540, "HOLD RS DOWN TO START METER",
+                960, 540,
+                "HOLD RS DOWN TO START METER",
                 color=(255, 100, 100, 255),
                 scale=3,
                 target=overlay.BOTH,

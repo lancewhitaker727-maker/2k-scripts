@@ -1,17 +1,11 @@
 import json
 import threading
 from pathlib import Path
-import os
-import ctypes
-import requests
 
 import cv2
 import numpy as np
 
-try:
-    from helios import controls as _helios_controls
-except Exception:
-    _helios_controls = None
+from helios import vision, meter, overlay
 
 BASE = Path(__file__).resolve().parent
 CFG = BASE / "meter_v2.json"
@@ -19,27 +13,42 @@ DEFAULT = {
     "meter_target": 99,
     "early_timing": 2,
     "late_timing": 2,
-    "detection_tolerance": 35,
-    "smoothing": 0,
-    "minimum_detection_confidence": 20,
-    "min_height": 25,
-    "max_height": 220,
-    "min_width": 5,
-    "max_width": 70,
+    "roi_x": 700,
+    "roi_y": 180,
+    "roi_w": 520,
+    "roi_h": 760,
+    "min_width": 8,
+    "max_width": 240,
+    "min_height": 20,
+    "max_height": 700,
+    "white_v_low": 205,
+    "white_s_high": 70,
     "green_h_low": 35,
     "green_h_high": 95,
     "green_s_low": 130,
     "green_v_low": 120,
-    "white_v_low": 205,
-    "white_s_high": 70,
+    "focus": True,
+    "adaptive_color": True,
+    "color_growth": 0,
 }
 SLIDERS = (
     ("Meter Target", "meter_target"),
     ("Early Timing", "early_timing"),
     ("Late Timing", "late_timing"),
-    ("Detection Tolerance", "detection_tolerance"),
-    ("Smoothing", "smoothing"),
-    ("Minimum Detection Confidence", "minimum_detection_confidence"),
+    ("ROI X", "roi_x"),
+    ("ROI Y", "roi_y"),
+    ("ROI Width", "roi_w"),
+    ("ROI Height", "roi_h"),
+    ("Min Width", "min_width"),
+    ("Max Width", "max_width"),
+    ("Min Height", "min_height"),
+    ("Max Height", "max_height"),
+    ("White V Low", "white_v_low"),
+    ("White S High", "white_s_high"),
+    ("Green H Low", "green_h_low"),
+    ("Green H High", "green_h_high"),
+    ("Green S Low", "green_s_low"),
+    ("Green V Low", "green_v_low"),
 )
 
 
@@ -56,63 +65,97 @@ def save_config(config):
 
 
 class CVWorker:
-    """Visual-only Helios CV worker with DLL-based meter tracking."""
+    """Helios Vision-based meter detector for NBA 2K Arrow2 meter."""
 
     def __init__(self, width, height):
         self.width = width
         self.height = height
         self._lock = threading.RLock()
-        self._packet_sequence = 0
-        self._smoothed_box = None
-        self._green_frames = 0
         self.c = load_config()
         self.last = None
         self._closed = False
         self._live = {
-            "tempo": "WAITING FOR METER",
+            "tempo": "INITIALIZING",
             "meter": None,
             "confidence": 0,
         }
         self._settings_started = False
+        self._release_cooldown = 0.1
+        self._last_release_time = 0
         
-        # Initialize DLL for meter tracking
-        self._init_dll()
+        # Initialize Helios Vision components
+        self._init_vision()
         self._start_settings_window()
 
-    def _init_dll(self):
-        """Initialize the DLL for enhanced meter tracking."""
+    def _init_vision(self):
+        """Initialize Helios Vision finders for white shaft and green cap detection."""
         try:
-            _script_dir = os.path.dirname(__file__)
-            _f = 'ch.dll'
-            _p = os.path.join(_script_dir, 'bin', _f)
-            if not os.path.exists(_p):
-                _r = requests.get(f'https://2kv.inputsense.com/nba2k/bin/{_f}', timeout=6)
-                _r.raise_for_status()
-                os.makedirs(os.path.dirname(_p), exist_ok=True)
-                with open(_p, 'wb') as _o:
-                    _o.write(_r.content)
+            # White shaft detection (meter body)
+            white_range = vision.BgrRange(
+                low=(0, 0, self.c["white_v_low"]),
+                high=(180, self.c["white_s_high"], 255),
+            )
+            self.white_finder = vision.ContourFinder(
+                colors=[white_range],
+                roi=(self.c["roi_x"], self.c["roi_y"], self.c["roi_w"], self.c["roi_h"]),
+                width=(self.c["min_width"], self.c["max_width"]),
+                height=(self.c["min_height"], self.c["max_height"]),
+                grouping=vision.GROUP_CONNECTED,
+                max_results=16,
+                focus=self.c["focus"],
+                focus_padding=16,
+                adaptive_color=self.c["adaptive_color"],
+                color_growth=self.c["color_growth"],
+            )
+            self.white_finder.set_visuals(
+                enabled=True,
+                show_roi=True,
+                show_outline=True,
+                roi_color=(255, 255, 255, 255),
+                outline_color=(255, 255, 255, 255),
+            )
             
-            self._d = ctypes.PyDLL(_p)
-            self._z = bytearray(1)
-            self._d.r.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
-            self._d.r.restype = ctypes.c_int
-            self._d.p.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-            self._d.p.restype = ctypes.c_int
-            self._d.g.argtypes = []
-            self._d.g.restype = ctypes.c_void_p
-            self._d.x.argtypes = []
-            self._d.x.restype = None
-            self._p = self._d.p
-            self._g = self._d.g
-            self._x = self._d.x
-            rc = self._d.r(self.width, self.height, _script_dir.encode('utf-8'))
-            if rc != 0:
-                print(f'DLL init warning: code {rc}')
-            self._dll_ready = True
+            # Green cap detection (release indicator)
+            green_range = vision.BgrRange(
+                low=(self.c["green_h_low"], self.c["green_s_low"], self.c["green_v_low"]),
+                high=(self.c["green_h_high"], 255, 255),
+            )
+            self.green_finder = vision.ContourFinder(
+                colors=[green_range],
+                roi=(self.c["roi_x"], self.c["roi_y"], self.c["roi_w"], self.c["roi_h"]),
+                width=(5, 42),
+                height=(4, 50),
+                grouping=vision.GROUP_CONNECTED,
+                max_results=16,
+                focus=False,
+                adaptive_color=self.c["adaptive_color"],
+                color_growth=self.c["color_growth"],
+            )
+            self.green_finder.set_visuals(
+                enabled=True,
+                show_roi=False,
+                show_outline=True,
+                outline_color=(0, 255, 0, 255),
+            )
+            
+            # Meter tracker
+            self.meter_tracker = meter.Meter()
+            self.meter_tracker.set_visuals(
+                enabled=True,
+                show_bbox=True,
+                show_path=True,
+                show_distance=False,
+                show_speed=True,
+                show_time_to_release=True,
+                show_elapsed_time=False,
+                bbox_color=(104, 244, 255, 255),
+                path_color=(104, 244, 255, 255),
+                metrics_color=(104, 244, 255, 255),
+                target=overlay.BOTH,
+            )
         except Exception as e:
-            print(f'DLL initialization failed: {e}')
-            self._dll_ready = False
-            self._z = bytearray(1)
+            print(f"Vision initialization failed: {e}")
+            raise
 
     def _start_settings_window(self):
         if self._settings_started:
@@ -128,13 +171,13 @@ class CVWorker:
 
         try:
             root = tk.Tk()
-            root.title("2K26 Helios Meter Settings")
+            root.title("2K26 Helios Vision Meter")
             root.resizable(False, False)
             root.configure(padx=14, pady=12)
 
-            title = tk.Label(root, text="Arrow2 Auto Release", font=("Segoe UI", 13, "bold"))
+            title = tk.Label(root, text="Arrow2 Meter Tracker", font=("Segoe UI", 13, "bold"))
             title.pack(anchor="w")
-            note = tk.Label(root, text="Hold RS down; Helios releases it when the Arrow2 meter turns green.")
+            note = tk.Label(root, text="Hold RS down; releases when meter turns green.")
             note.pack(anchor="w", pady=(0, 8))
 
             value_labels = {}
@@ -150,7 +193,7 @@ class CVWorker:
                 slider = tk.Scale(
                     group,
                     from_=0,
-                    to=99,
+                    to=255 if key.startswith(("white", "green")) else 999,
                     orient="horizontal",
                     showvalue=False,
                     resolution=1,
@@ -173,7 +216,7 @@ class CVWorker:
                     widget.configure(text=str(int(config[key])))
                 meter = "--" if live["meter"] is None else f"{live['meter']:.0f}%"
                 live_label.configure(
-                    text=f"TEMPO: {live['tempo']}\nMETER: {meter}\nCONFIDENCE: {live['confidence']:.0f}%"
+                    text=f"STATUS: {live['tempo']}\nMETER: {meter}\nCONFIDENCE: {live['confidence']:.0f}%"
                 )
                 root.after(100, refresh)
 
@@ -185,8 +228,35 @@ class CVWorker:
 
     def _set_setting(self, key, value):
         with self._lock:
-            self.c[key] = max(0, min(99, int(float(value))))
+            self.c[key] = max(0, min(255, int(float(value))))
             save_config(self.c)
+            
+            # Update vision settings if changed
+            if key.startswith("roi") or key.startswith(("min_", "max_")):
+                try:
+                    self.white_finder.set_roi((self.c["roi_x"], self.c["roi_y"], self.c["roi_w"], self.c["roi_h"]))
+                    self.white_finder.set_size_range(
+                        width=(self.c["min_width"], self.c["max_width"]),
+                        height=(self.c["min_height"], self.c["max_height"]),
+                    )
+                    self.green_finder.set_roi((self.c["roi_x"], self.c["roi_y"], self.c["roi_w"], self.c["roi_h"]))
+                except Exception:
+                    pass
+            elif key.startswith(("white_", "green_")):
+                try:
+                    white_range = vision.BgrRange(
+                        low=(0, 0, self.c["white_v_low"]),
+                        high=(180, self.c["white_s_high"], 255),
+                    )
+                    self.white_finder.set_colors([white_range])
+                    
+                    green_range = vision.BgrRange(
+                        low=(self.c["green_h_low"], self.c["green_s_low"], self.c["green_v_low"]),
+                        high=(self.c["green_h_high"], 255, 255),
+                    )
+                    self.green_finder.set_colors([green_range])
+                except Exception:
+                    pass
 
     def _config(self):
         with self._lock:
@@ -201,147 +271,104 @@ class CVWorker:
             return "LATE"
         return "PERFECT"
 
-    def _release_right_stick(self):
-        """Send a Helios override that returns Right Stick Y to neutral."""
-        packet = bytearray(48)
-        self._packet_sequence = (self._packet_sequence % 254) + 1
-        packet[0] = self._packet_sequence
-        packet[29] = 101
-        packet[36:40] = (0).to_bytes(4, byteorder="big", signed=True)
-        if _helios_controls is not None:
-            try:
-                _helios_controls.send_cvdata(packet)
-            except Exception:
-                pass
-        return packet
+    def _release_shot(self):
+        """Trigger shot release when in perfect range."""
+        import time
+        current_time = time.time()
+        if current_time - self._last_release_time < self._release_cooldown:
+            return
+        self._last_release_time = current_time
+        
+        try:
+            from helios import controls
+            controls.send_controller_input({"rs": 0})  # Release right stick
+        except Exception:
+            pass
 
     def process(self, frame):
         if frame is None or frame.size == 0:
             return frame, bytearray()
 
         config = self._config()
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        white_mask = cv2.inRange(
-            hsv,
-            np.array([0, 0, config["white_v_low"]], np.uint8),
-            np.array([180, config["white_s_high"], 255], np.uint8),
-        )
-        green_mask = cv2.inRange(
-            hsv,
-            np.array([config["green_h_low"], config["green_s_low"], config["green_v_low"]], np.uint8),
-            np.array([config["green_h_high"], 255, 255], np.uint8),
-        )
-        kernel = np.ones((3, 3), np.uint8)
-        white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
-        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
-
-        white_contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        bodies = []
-        caps = []
-        for contour in white_contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if 5 <= w <= 60 and 40 <= h <= 220 and h / max(1, w) >= 2.0:
-                width_fit = max(0.0, 1.0 - abs(w - 20.0) / 18.0)
-                height_fit = max(0.0, 1.0 - abs(h - 105.0) / 90.0)
-                bodies.append((100.0 * (0.55 * width_fit + 0.45 * height_fit), (x, y, w, h)))
-        for contour in green_contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if 5 <= w <= 42 and 4 <= h <= 50 and 0.20 <= h / max(1, w) <= 3.0:
-                caps.append((x, y, w, h))
-
-        tolerance = config["detection_tolerance"]
-        best = None
-        for body_score, (bx, by, bw, bh) in bodies:
-            body_center = bx + bw / 2.0
-            for cx, cy, cw, ch in caps:
-                cap_center = cx + cw / 2.0
-                horizontal_error = abs(cap_center - body_center)
-                vertical_offset = cy + ch / 2.0 - by
-                max_horizontal = bw * 0.75 + tolerance * 0.25
-                if horizontal_error > max_horizontal or not (-35 - tolerance * 0.2 <= vertical_offset <= bh * 0.30):
-                    continue
-                align = max(0.0, 1.0 - horizontal_error / max_horizontal)
-                top_fit = max(0.0, 1.0 - abs(vertical_offset) / max(35.0, bh * 0.35))
-                confidence = 0.55 * body_score + 45.0 * (0.60 * align + 0.40 * top_fit)
-                if best is None or confidence > best[0]:
-                    best = (confidence, (bx, by, bw, bh), (cx, cy, cw, ch))
-
+        
+        # Find white shaft contours
+        white_results = self.white_finder.find()
+        green_results = self.green_finder.find()
+        
         tempo = "SEARCHING FOR ARROW2"
-        meter = None
+        meter_value = None
         confidence = 0.0
         release_shot = False
+        
+        # Draw frame border
         cv2.rectangle(frame, (2, 2), (frame.shape[1] - 3, frame.shape[0] - 3), (255, 210, 0), 2)
-
-        if best is not None:
-            confidence, body, cap = best
-            bx, by, bw, bh = body
-            cx, cy, cw, ch = cap
-            raw_box = np.array([bx, by, bw, bh], dtype=np.float32)
-            if self._smoothed_box is None:
-                self._smoothed_box = raw_box
-            else:
-                alpha = max(0.05, (100 - config["smoothing"]) / 100.0)
-                self._smoothed_box = alpha * raw_box + (1.0 - alpha) * self._smoothed_box
-            sx, sy, sw, sh = self._smoothed_box
-
-            cap_y = cy + ch / 2.0
-            meter = max(0.0, min(100.0, 100.0 * ((sy + sh) - cap_y) / max(1.0, sh)))
-            self.last = meter
-            self._last_arrow = (bx, by, bw, bh)
-
-            if confidence >= config["minimum_detection_confidence"]:
-                self._green_frames += 1
+        
+        # Match white shaft with green cap
+        if len(white_results) > 0 and len(green_results) > 0:
+            best_white = white_results[0]
+            best_green = None
+            
+            # Find green cap closest to white shaft top
+            white_top = best_white.centroid[1] - best_white.bounds[3] / 2
+            min_distance = float('inf')
+            
+            for green in green_results:
+                distance = abs(green.centroid[1] - white_top)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_green = green
+            
+            if best_green is not None:
+                confidence = (best_white.confidence + best_green.confidence) / 2
                 
+                # Calculate meter position (green cap position on white shaft)
+                shaft_top = best_white.bounds[1]
+                shaft_bottom = best_white.bounds[1] + best_white.bounds[3]
+                green_y = best_green.centroid[1]
+                
+                meter_value = max(0.0, min(100.0, 100.0 * (shaft_bottom - green_y) / best_white.bounds[3]))
+                self.last = meter_value
+                
+                # Check if meter is in perfect range
                 target = config["meter_target"]
-                if target - config["early_timing"] <= meter <= target + config["late_timing"]:
+                if target - config["early_timing"] <= meter_value <= target + config["late_timing"]:
                     tempo = "PERFECT"
                     release_shot = True
-                    self._release_right_stick()
+                    self._release_shot()
                 else:
-                    tempo = self._tempo(meter, config)
+                    tempo = self._tempo(meter_value, config)
                 
-                cv2.rectangle(frame, (int(sx), int(sy)), (int(sx + sw), int(sy + sh)), (255, 255, 255), 2)
-                cv2.rectangle(frame, (cx, cy), (cx + cw, cy + ch), (0, 255, 0), 2)
-            else:
-                self._green_frames = 0
-                tempo = "LOW CONFIDENCE"
-        else:
-            self._green_frames = 0
-            self._smoothed_box = None
-            self._last_arrow = None
-            self.last = None
-
+                # Update meter tracker for visualization
+                meter_point = (int(best_green.centroid[0]), int(green_y))
+                release_point = (int(best_white.centroid[0]), int(shaft_top))
+                bbox = best_white.bounds
+                
+                self.meter_tracker.update(
+                    point=meter_point,
+                    release_point=release_point,
+                    bounding_box=bbox,
+                    padding=8,
+                )
+        
         with self._lock:
-            self._live = {"tempo": tempo, "meter": meter, "confidence": confidence}
-
-        meter_text = "--" if meter is None else f"{meter:.0f}%"
+            self._live = {
+                "tempo": tempo,
+                "meter": meter_value,
+                "confidence": confidence,
+            }
+        
+        # Draw HUD info
+        meter_text = "--" if meter_value is None else f"{meter_value:.0f}%"
         color = (0, 255, 0) if release_shot else (0, 200, 255)
         cv2.rectangle(frame, (10, 10), (440, 126), (20, 24, 29), -1)
         cv2.putText(frame, "2K26 ARROW2 METER", (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (235, 240, 245), 2)
-        cv2.putText(frame, f"TEMPO: {tempo}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(frame, f"STATUS: {tempo}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
         cv2.putText(frame, f"METER: {meter_text}   CONF: {confidence:.0f}%", (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (225, 230, 235), 1)
-        cv2.putText(frame, "HOLD RS DOWN - TITAN GPC RELEASES", (20, 111), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (145, 155, 165), 1)
-
-        # Process through DLL if available
-        if self._dll_ready:
-            try:
-                sz = self._p(frame.ctypes.data, frame.shape[1], frame.shape[0], frame.strides[0])
-                if sz > 0:
-                    _result = bytearray(sz)
-                    ctypes.memmove((ctypes.c_ubyte * sz).from_buffer(_result), self._g(), sz)
-                    return frame, _result
-            except Exception:
-                pass
+        cv2.putText(frame, "HOLD RS DOWN - AUTO RELEASE", (20, 111), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (145, 155, 165), 1)
         
         return frame, bytearray()
 
     def close(self):
-        if hasattr(self, '_x') and self._x is not None:
-            try:
-                self._x()
-            except Exception:
-                pass
         self._closed = True
 
     def __del__(self):

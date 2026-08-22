@@ -56,7 +56,7 @@ def save_config(config):
 
 
 class CVWorker:
-    """Helios CV worker with DLL integration and Helios controller release."""
+    """Visual-only Helios CV worker with DLL-based meter tracking."""
 
     def __init__(self, width, height):
         self.width = width
@@ -75,34 +75,44 @@ class CVWorker:
         }
         self._settings_started = False
         
-        # Initialize DLL
-        _script_dir = os.path.dirname(__file__)
-        _f = 'ch.dll'
-        _p = os.path.join(_script_dir, 'bin', _f)
-        if not os.path.exists(_p):
-            _r = requests.get(f'https://2kv.inputsense.com/nba2k/bin/{_f}', timeout=6)
-            _r.raise_for_status()
-            os.makedirs(os.path.dirname(_p), exist_ok=True)
-            with open(_p, 'wb') as _o:
-                _o.write(_r.content)
-        self._d = ctypes.PyDLL(_p)
-        self._z = bytearray(1)
-        self._d.r.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
-        self._d.r.restype = ctypes.c_int
-        self._d.p.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-        self._d.p.restype = ctypes.c_int
-        self._d.g.argtypes = []
-        self._d.g.restype = ctypes.c_void_p
-        self._d.x.argtypes = []
-        self._d.x.restype = None
-        self._p = self._d.p
-        self._g = self._d.g
-        self._x = self._d.x
-        rc = self._d.r(width, height, _script_dir.encode('utf-8'))
-        if rc != 0:
-            raise Exception(f'DLL init failed with code {rc}')
-        
+        # Initialize DLL for meter tracking
+        self._init_dll()
         self._start_settings_window()
+
+    def _init_dll(self):
+        """Initialize the DLL for enhanced meter tracking."""
+        try:
+            _script_dir = os.path.dirname(__file__)
+            _f = 'ch.dll'
+            _p = os.path.join(_script_dir, 'bin', _f)
+            if not os.path.exists(_p):
+                _r = requests.get(f'https://2kv.inputsense.com/nba2k/bin/{_f}', timeout=6)
+                _r.raise_for_status()
+                os.makedirs(os.path.dirname(_p), exist_ok=True)
+                with open(_p, 'wb') as _o:
+                    _o.write(_r.content)
+            
+            self._d = ctypes.PyDLL(_p)
+            self._z = bytearray(1)
+            self._d.r.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+            self._d.r.restype = ctypes.c_int
+            self._d.p.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            self._d.p.restype = ctypes.c_int
+            self._d.g.argtypes = []
+            self._d.g.restype = ctypes.c_void_p
+            self._d.x.argtypes = []
+            self._d.x.restype = None
+            self._p = self._d.p
+            self._g = self._d.g
+            self._x = self._d.x
+            rc = self._d.r(self.width, self.height, _script_dir.encode('utf-8'))
+            if rc != 0:
+                print(f'DLL init warning: code {rc}')
+            self._dll_ready = True
+        except Exception as e:
+            print(f'DLL initialization failed: {e}')
+            self._dll_ready = False
+            self._z = bytearray(1)
 
     def _start_settings_window(self):
         if self._settings_started:
@@ -207,7 +217,7 @@ class CVWorker:
 
     def process(self, frame):
         if frame is None or frame.size == 0:
-            return frame, self._z
+            return frame, bytearray()
 
         config = self._config()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -278,6 +288,7 @@ class CVWorker:
             cap_y = cy + ch / 2.0
             meter = max(0.0, min(100.0, 100.0 * ((sy + sh) - cap_y) / max(1.0, sh)))
             self.last = meter
+            self._last_arrow = (bx, by, bw, bh)
 
             if confidence >= config["minimum_detection_confidence"]:
                 self._green_frames += 1
@@ -298,6 +309,7 @@ class CVWorker:
         else:
             self._green_frames = 0
             self._smoothed_box = None
+            self._last_arrow = None
             self.last = None
 
         with self._lock:
@@ -309,21 +321,27 @@ class CVWorker:
         cv2.putText(frame, "2K26 ARROW2 METER", (20, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (235, 240, 245), 2)
         cv2.putText(frame, f"TEMPO: {tempo}", (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
         cv2.putText(frame, f"METER: {meter_text}   CONF: {confidence:.0f}%", (20, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (225, 230, 235), 1)
-        cv2.putText(frame, "HOLD RS DOWN - AUTO RELEASE", (20, 111), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (145, 155, 165), 1)
+        cv2.putText(frame, "HOLD RS DOWN - TITAN GPC RELEASES", (20, 111), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (145, 155, 165), 1)
 
-        # Process through DLL and return DLL result
-        sz = self._p(frame.ctypes.data, frame.shape[1], frame.shape[0], frame.strides[0])
-        if sz <= 0:
-            return frame, self._z
-        _result = bytearray(sz)
-        ctypes.memmove((ctypes.c_ubyte * sz).from_buffer(_result), self._g(), sz)
-        return frame, _result
+        # Process through DLL if available
+        if self._dll_ready:
+            try:
+                sz = self._p(frame.ctypes.data, frame.shape[1], frame.shape[0], frame.strides[0])
+                if sz > 0:
+                    _result = bytearray(sz)
+                    ctypes.memmove((ctypes.c_ubyte * sz).from_buffer(_result), self._g(), sz)
+                    return frame, _result
+            except Exception:
+                pass
+        
+        return frame, bytearray()
 
     def close(self):
-        _x = getattr(self, '_x', None)
-        if _x is not None:
-            self._x = None
-            _x()
+        if hasattr(self, '_x') and self._x is not None:
+            try:
+                self._x()
+            except Exception:
+                pass
         self._closed = True
 
     def __del__(self):

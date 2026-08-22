@@ -62,8 +62,6 @@ class CVWorker:
         self._release_cooldown = 0.05
         self._last_release_time = 0
         self._rs_held_start = None
-        self._calibrating = False
-        self._calibration_rois = []
         
         # Initialize Helios Vision components
         self._init_vision()
@@ -234,19 +232,11 @@ class CVWorker:
             else:
                 tempo = "DETECTING METER..."
         else:
-            # RS not held
+            # RS not held - draw instruction on frame instead of overlay
             self._rs_held_start = None
             tempo = "WAITING FOR RS"
-            
-            # Draw instruction
-            overlay.text(
-                960, 540,
-                "HOLD RS DOWN TO START METER",
-                color=(255, 100, 100, 255),
-                scale=3,
-                target=overlay.BOTH,
-                anchor=overlay.CENTER,
-            )
+            cv2.putText(frame, "HOLD RS DOWN TO START METER", (400, 540), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (100, 100, 255), 3)
         
         with self._lock:
             self._live = {
